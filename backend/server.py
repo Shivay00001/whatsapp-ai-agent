@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from twilio.request_validator import RequestValidator
 from twilio.rest import Client
+from twilio.http.async_http_client import AsyncTwilioHttpClient
 from dotenv import load_dotenv
 import litellm
 from pydantic import BaseModel
@@ -103,12 +104,19 @@ async def process_whatsapp_message_task(sender: str, user_message: str, reply_ca
             ai_reply = "Sorry, I am having trouble connecting to my brain right now."
             for attempt in range(3):
                 try:
-                    response = await litellm.acompletion(
-                        model=provider,
-                        messages=messages,
-                        api_key=get_active_key(provider),
-                        max_tokens=500,
-                        timeout=10.0
+                    # Guard the whole call: litellm's own timeout may never
+                    # fire if the client construction itself hangs (seen in
+                    # sandboxes with misbehaving proxy env vars), so cap the
+                    # total wall-clock time per attempt.
+                    response = await asyncio.wait_for(
+                        litellm.acompletion(
+                            model=provider,
+                            messages=messages,
+                            api_key=get_active_key(provider),
+                            max_tokens=500,
+                            timeout=10.0
+                        ),
+                        timeout=30.0
                     )
                     ai_reply = response.choices[0].message.content
                     break
@@ -128,6 +136,22 @@ async def process_whatsapp_message_task(sender: str, user_message: str, reply_ca
             print(f"Critical Pipeline Error: {e}")
 
 # ==========================================
+# HEALTH / READINESS
+# ==========================================
+@app.get("/health")
+async def health():
+    """Readiness probe: process is up and the DB is reachable."""
+    try:
+        async with SessionLocal() as db:
+            await db.execute(select(1))
+        db_status = "ok"
+    except Exception as e:
+        db_status = f"error: {e}"
+    status = "ok" if db_status == "ok" else "degraded"
+    return {"status": status, "db": db_status}
+
+
+# ==========================================
 # TWILIO API ENDPOINT
 # ==========================================
 async def send_twilio_message(to_number: str, text: str):
@@ -137,13 +161,26 @@ async def send_twilio_message(to_number: str, text: str):
         token = await get_api_key(db, "twilio_auth_token", "TWILIO_AUTH_TOKEN")
         twilio_number = await get_api_key(db, "twilio_phone_number", "TWILIO_PHONE_NUMBER")
     
-    client = Client(sid, token)
-    
-    await client.messages.create_async(
-        body=text,
-        from_=f"whatsapp:{twilio_number}",
-        to=f"whatsapp:{to_number}"
-    )
+    async_client = AsyncTwilioHttpClient()
+    client = Client(sid, token, http_client=async_client)
+
+    try:
+        await client.messages.create_async(
+            body=text,
+            from_=f"whatsapp:{twilio_number}",
+            to=f"whatsapp:{to_number}"
+        )
+    finally:
+        await async_client.close()
+
+def _twilio_signature_validation_enabled() -> bool:
+    """
+    Twilio webhook signature validation is ON by default for security.
+    Set TWILIO_VALIDATE_SIGNATURE=0 / false to disable for local dev or
+    non-HTTPS test tunnels where the exact public URL is unknown.
+    """
+    return os.getenv("TWILIO_VALIDATE_SIGNATURE", "true").strip().lower() not in ("0", "false", "no", "off")
+
 
 @app.post("/webhook/whatsapp")
 async def twilio_webhook(
@@ -155,14 +192,16 @@ async def twilio_webhook(
     auth_token = os.getenv("TWILIO_AUTH_TOKEN")
     if not auth_token:
         raise HTTPException(status_code=500, detail="Server misconfiguration")
-    
+
     validator = RequestValidator(auth_token)
     form_data = await request.form()
-    
-    # In production, construct the exact URL Twilio hit.
-    # url = str(request.url).replace("http://", "https://") 
-    # if not validator.validate(url, form_data, x_twilio_signature):
-    #     raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
+    if _twilio_signature_validation_enabled():
+        # Validate against the exact URL Twilio hit. Behind a proxy, forward
+        # the original public URL via X-Forwarded-Proto/Host handling of the app server.
+        url = str(request.url).replace("http://", "https://")
+        if not x_twilio_signature or not validator.validate(url, dict(form_data), x_twilio_signature):
+            raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
     sender = form_data.get("From", "").replace("whatsapp:", "")
     body = form_data.get("Body", "")

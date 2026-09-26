@@ -28,3 +28,10 @@ npm run dev
 
 ## Coordination & Automation
 This agent is part of a larger ecosystem. It can be executed natively via its UI, or coordinated as a node in a multi-agent pipeline using the Central Connector System.
+
+## Security notes
+- `GET /health` is a readiness probe (process + DB check). `GET /docs` is FastAPI's auto-docs.
+- Inbound `POST /webhook/whatsapp` Twilio requests are signature-validated
+  (`X-Twilio-Signature`) by default. Set `TWILIO_VALIDATE_SIGNATURE=false` in
+  your env **only** for local development (localhost without a public URL).
+  Keep it enabled in production — disabling it lets anyone POST fake messages.
